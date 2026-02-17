@@ -228,7 +228,7 @@ except Exception as e:
 try:
     if not os.path.exists(MODEL_H5):
         raise FileNotFoundError(f"Missing {MODEL_H5}")
-    model = load_model(MODEL_H5)
+    model = load_model(MODEL_H5, compile=False)
     st.sidebar.success("✅ Loaded models/lstm_model.h5")
 except Exception as e:
     st.sidebar.error("❌ lstm_model.h5 not found or invalid")
