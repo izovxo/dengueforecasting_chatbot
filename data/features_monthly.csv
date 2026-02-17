@@ -1,0 +1,23 @@
+Nueva Vizcaya Climate + Dengue (Monthly) — LSTM-ready workbook
+""
+Inputs / Sources:
+"- Climate: NASA POWER Point Monthly CSV (2015-01 to 2025-12) for 16.49N, 121.17E"
+  Source tool: https://power.larc.nasa.gov/
+- Dengue cases: 'Nueva_Vizcaya_Monthly_Cases_2015_2025_ObservedPlusEstimated.xlsx' (Observed 2015–2022; Estimated 2023–2025)
+""
+Method (aligned with your Chapter 3):
+- Data integration at monthly level (DATE).
+- Train/Test split: TRAIN = 2015-01 to 2022-12; TEST = 2023-01 to 2025-12.
+- Feature engineering:
+  * Seasonality: MONTH_SIN and MONTH_COS (cyclical encoding).
+  * Lagged features: LAG_1 to LAG_12 for climate variables and dengue cases.
+- Scaling: Min-Max scaling computed ONLY from TRAIN rows (prevents data leakage).
+""
+Sheets you will use for LSTM:
+- Win12_ClimCases_Scaled: 12-month window features (scaled) + target dengue cases.
+- Win12_Clim_Scaled: same but climate-only (no dengue lags).
+""
+""
+""
+"Tip: If you want a plug-and-play dataset with no formulas, use the *_Values sheets."
+For LSTM input (already windowed): Win12_ClimCases_Scaled_Values or Win12_Clim_Scaled_Values.
