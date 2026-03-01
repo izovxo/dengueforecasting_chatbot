@@ -1,8 +1,9 @@
-# app.py — Dengue Forecast Chatbot (LSTM) + 10-Year Forecast Viewer
-# Drop this file into your repo root, replacing your old app.py
+# app.py — Dengue Forecast Chatbot (LSTM) + 10-Year Forecast Viewer (with Risk Levels + Uncertainty)
+# Replace your old app.py with this file
 
 import os
 import json
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -34,7 +35,6 @@ def parse_12_cases(text: str):
     vals = [r.strip() for r in raw if r.strip() != ""]
     nums = []
     for v in vals:
-        # allow "12 " or " 12" etc.
         nums.append(float(re.sub(r"[^\d\.\-eE+]", "", v)))
     return nums
 
@@ -55,7 +55,6 @@ def load_feature_cols(path_json):
 def load_features_table(path_csv):
     df = safe_read_csv(path_csv)
 
-    # accept DATE or DATE_TARGET
     if "DATE" in df.columns:
         date_col = "DATE"
     elif "DATE_TARGET" in df.columns:
@@ -67,7 +66,6 @@ def load_features_table(path_csv):
     df[date_col] = df[date_col].apply(month_start)
     df = df.sort_values(date_col).reset_index(drop=True)
 
-    # normalize to a single name "DATE"
     if date_col != "DATE":
         df = df.rename(columns={date_col: "DATE"})
 
@@ -78,7 +76,6 @@ def load_calibration(path_csv):
         return None
     cal = pd.read_csv(path_csv)
 
-    # expected columns: Model, a_intercept, b_slope
     needed = {"Model", "a_intercept", "b_slope"}
     if not needed.issubset(set(cal.columns)):
         return None
@@ -86,6 +83,7 @@ def load_calibration(path_csv):
     row = cal.loc[cal["Model"].astype(str).str.lower() == "lstm"]
     if row.empty:
         return None
+
     a = float(row.iloc[0]["a_intercept"])
     b = float(row.iloc[0]["b_slope"])
     return (a, b)
@@ -100,11 +98,7 @@ def load_forecast_csv(path):
     return f
 
 def compute_dengue_minmax_from_table(features_df):
-    """
-    Uses TRAIN rows if SET exists; else uses full DENGUE_CASES_TARGET column.
-    """
     if "DENGUE_CASES_TARGET" not in features_df.columns:
-        # fallback (less correct)
         return (0.0, float(features_df.select_dtypes(include=[np.number]).max().max()))
 
     if "SET" in features_df.columns:
@@ -114,7 +108,6 @@ def compute_dengue_minmax_from_table(features_df):
             dmax = float(train_rows["DENGUE_CASES_TARGET"].max())
             return dmin, dmax
 
-    # fallback: full column
     dmin = float(features_df["DENGUE_CASES_TARGET"].min())
     dmax = float(features_df["DENGUE_CASES_TARGET"].max())
     return dmin, dmax
@@ -136,23 +129,14 @@ def apply_calibration(pred_cases, cal_params):
     return np.clip(pred_cal, 0.0, None)
 
 def build_X_for_month(features_df, feature_cols, target_month, last12_cases, dmin, dmax, timesteps=1):
-    """
-    Builds ONE model input row for a given target_month using:
-    - all non-dengue-lag features from features_monthly.csv for that month
-    - dengue lag features computed from user last12_cases (scaled)
-    """
     row = features_df.loc[features_df["DATE"] == target_month]
     if row.empty:
         raise ValueError(f"No row found for month {target_month.date()} in features_monthly.csv")
 
     base = row.iloc[0].to_dict()
 
-    # compute scaled dengue lags from last12_cases
     last12_scaled = scale_cases(last12_cases, dmin, dmax)
-
-    dengue_lag_map = {}
-    for k in range(1, 13):
-        dengue_lag_map[f"DENGUE_CASES_LAG_{k}_SCALED"] = float(last12_scaled[-k])
+    dengue_lag_map = {f"DENGUE_CASES_LAG_{k}_SCALED": float(last12_scaled[-k]) for k in range(1, 13)}
 
     missing = []
     feat_vals = []
@@ -169,8 +153,7 @@ def build_X_for_month(features_df, feature_cols, target_month, last12_cases, dmi
         raise ValueError(
             "Some model features are missing in features_monthly.csv.\n"
             f"Missing columns: {missing}\n\n"
-            "Fix: regenerate features_monthly.csv from the SAME sheet used for training "
-            "so all scaled lag columns exist."
+            "Fix: regenerate features_monthly.csv from the SAME sheet used for training."
         )
 
     X = np.array(feat_vals, dtype=np.float32).reshape(1, timesteps, len(feature_cols))
@@ -178,10 +161,6 @@ def build_X_for_month(features_df, feature_cols, target_month, last12_cases, dmi
 
 def recursive_forecast(model, features_df, feature_cols, last_observed_month, last12_cases,
                        horizon, dmin, dmax, cal_params, timesteps=1):
-    """
-    Predict next horizon months recursively (multi-step).
-    Model outputs scaled dengue; we unscale to cases; optionally calibrate.
-    """
     history_cases = list(map(float, last12_cases))
     preds = []
 
@@ -190,15 +169,7 @@ def recursive_forecast(model, features_df, feature_cols, last_observed_month, la
     for i in range(horizon):
         target_month = (start_month.to_period("M") + i).to_timestamp()
 
-        X = build_X_for_month(
-            features_df=features_df,
-            feature_cols=feature_cols,
-            target_month=target_month,
-            last12_cases=history_cases[-12:],
-            dmin=dmin,
-            dmax=dmax,
-            timesteps=timesteps
-        )
+        X = build_X_for_month(features_df, feature_cols, target_month, history_cases[-12:], dmin, dmax, timesteps)
 
         pred_scaled = float(model.predict(X, verbose=0).reshape(-1)[0])
         pred_cases = float(unscale_cases([pred_scaled], dmin, dmax)[0])
@@ -206,13 +177,7 @@ def recursive_forecast(model, features_df, feature_cols, last_observed_month, la
 
         pred_cases_cal = float(apply_calibration([pred_cases], cal_params)[0])
 
-        preds.append({
-            "DATE": target_month,
-            "PRED_CASES_RAW": pred_cases,
-            "PRED_CASES_CAL": pred_cases_cal
-        })
-
-        # update history with calibrated (recommended)
+        preds.append({"DATE": target_month, "PRED_CASES_RAW": pred_cases, "PRED_CASES_CAL": pred_cases_cal})
         history_cases.append(pred_cases_cal)
 
     return pd.DataFrame(preds)
@@ -223,11 +188,7 @@ def recursive_forecast(model, features_df, feature_cols, last_observed_month, la
 # =========================
 st.sidebar.title("Dengue Forecast Dashboard")
 
-page = st.sidebar.radio(
-    "Choose view",
-    ["Predict (Chatbot)", "10-Year Forecast", "Debug / Files"]
-)
-
+page = st.sidebar.radio("Choose view", ["Predict (Chatbot)", "10-Year Forecast", "Debug / Files"])
 st.sidebar.divider()
 st.sidebar.header("Files Status")
 
@@ -249,7 +210,7 @@ except Exception as e:
     st.sidebar.exception(e)
     st.stop()
 
-# Load model
+# Load model safely
 try:
     if not os.path.exists(MODEL_H5):
         raise FileNotFoundError(f"Missing {MODEL_H5}")
@@ -262,7 +223,6 @@ except Exception as e:
 
 # Validate model input shape vs feature_cols
 try:
-    # Keras usually returns (None, timesteps, features)
     input_shape = model.input_shape
     timesteps = int(input_shape[1]) if input_shape and len(input_shape) >= 3 else 1
     nfeat_model = int(input_shape[2]) if input_shape and len(input_shape) >= 3 else len(feature_cols)
@@ -271,10 +231,7 @@ try:
         st.sidebar.error("❌ Feature mismatch (Model vs feature_cols.json)")
         st.sidebar.write(f"Model expects features = **{nfeat_model}**")
         st.sidebar.write(f"feature_cols.json has = **{len(feature_cols)}**")
-        st.sidebar.info(
-            "Fix: upload the correct feature_cols.json that matches the model training, "
-            "or retrain/resave the model using the same feature list."
-        )
+        st.sidebar.info("Fix: upload matching feature_cols.json or retrain/resave model.")
         st.stop()
 except Exception as e:
     st.sidebar.warning("Could not validate model input shape.")
@@ -299,14 +256,11 @@ st.sidebar.write(f"Max_train = {dmax:.2f}")
 
 
 # =========================
-# PAGE: PREDICT (CHATBOT)
+# PAGE 1: CHATBOT PREDICT
 # =========================
 if page == "Predict (Chatbot)":
     st.title("💬 LGU Chatbot Input (Climate-integrated LSTM)")
-    st.write(
-        "Enter the last **12 months** of dengue cases. The app uses your dataset’s climate/season features "
-        "and your trained LSTM to predict the next months."
-    )
+    st.write("Enter last **12 months** dengue cases → predicts next months using climate-integrated LSTM.")
 
     available_months = features_df["DATE"].drop_duplicates().sort_values().tolist()
     if not available_months:
@@ -318,37 +272,30 @@ if page == "Predict (Chatbot)":
         last_month = st.selectbox(
             "Select the LAST month you have actual dengue cases for:",
             options=available_months,
-            index=max(0, len(available_months) - 13)  # roughly last year
+            index=max(0, len(available_months) - 13)
         )
     with col2:
-        horizon = st.slider("How many months ahead to predict?", min_value=1, max_value=12, value=3)
+        horizon = st.slider("How many months ahead to predict?", 1, 12, 3)
 
-    st.markdown("**Enter the last 12 monthly dengue cases (oldest → newest).**")
+    st.markdown("**Enter last 12 monthly dengue cases (oldest → newest).**")
     cases_text = st.text_area(
         "Paste 12 numbers separated by commas or new lines",
         height=140,
         placeholder="Example:\n12, 18, 25, 40, 55, 60, 45, 30, 22, 19, 15, 20"
     )
 
-    run = st.button("🔮 Predict")
-
-    if run:
+    if st.button("🔮 Predict"):
         try:
             last12_cases = parse_12_cases(cases_text)
             if len(last12_cases) != 12:
-                st.error(f"You entered {len(last12_cases)} values. Please enter exactly 12 months.")
+                st.error(f"You entered {len(last12_cases)} values. Please enter exactly 12.")
                 st.stop()
 
-            # Check forecast months exist
             start_month = (pd.Timestamp(last_month).to_period("M") + 1).to_timestamp()
             needed = [(start_month.to_period("M") + i).to_timestamp() for i in range(horizon)]
             missing = [m for m in needed if (features_df["DATE"] == m).sum() == 0]
             if missing:
-                st.error(
-                    "Your features table is missing some forecast months:\n"
-                    + "\n".join([str(m.date()) for m in missing])
-                    + "\n\nFix: ensure features_monthly.csv includes rows up to your forecast horizon."
-                )
+                st.error("Missing forecast months in features table:\n" + "\n".join([str(m.date()) for m in missing]))
                 st.stop()
 
             with st.spinner("Forecasting..."):
@@ -367,12 +314,12 @@ if page == "Predict (Chatbot)":
 
             st.success("Done ✅")
 
-            out = pred_df.copy()
-            out["DATE"] = out["DATE"].dt.strftime("%Y-%m-%d")
+            show = pred_df.copy()
+            show["DATE"] = show["DATE"].dt.strftime("%Y-%m-%d")
             st.subheader("Predictions")
-            st.dataframe(out, use_container_width=True)
+            st.dataframe(show, use_container_width=True)
 
-            st.subheader("Forecast Chart")
+            st.subheader("Chart")
             fig = plt.figure()
             x = pd.to_datetime(pred_df["DATE"])
             plt.plot(x, pred_df["PRED_CASES_RAW"], marker="o", label="Pred (raw)")
@@ -383,35 +330,25 @@ if page == "Predict (Chatbot)":
             plt.legend()
             st.pyplot(fig, clear_figure=True)
 
-            st.subheader("Download")
-            csv_bytes = pred_df.assign(DATE=pred_df["DATE"].dt.strftime("%Y-%m-%d")).to_csv(index=False).encode("utf-8")
             st.download_button(
-                "⬇️ Download predictions as CSV",
-                data=csv_bytes,
+                "⬇️ Download predictions CSV",
+                data=pred_df.assign(DATE=pred_df["DATE"].dt.strftime("%Y-%m-%d")).to_csv(index=False).encode("utf-8"),
                 file_name="dengue_predictions_chatbot.csv",
                 mime="text/csv"
             )
 
-            st.caption(
-                "Note: This tool uses climate/features from your dataset and predicts dengue cases using your trained LSTM. "
-                "Outputs are decision-support estimates, not diagnostic."
-            )
-
         except Exception as e:
-            st.error("Something went wrong:")
+            st.error("Error:")
             st.exception(e)
 
 
 # =========================
-# PAGE: 10-YEAR FORECAST (CSV VIEWER)
+# PAGE 2: 10-YEAR FORECAST
 # =========================
 elif page == "10-Year Forecast":
-    st.title("📈 10-Year Forecast (Precomputed CSV)")
+    st.title("📈 10-Year Forecast (Precomputed CSV + Risk Levels)")
 
-    st.write(
-        "This page displays a **precomputed** long-horizon forecast (e.g., from Google Colab). "
-        "Upload your file as `data/FORECAST_10Y.csv` in your GitHub repo."
-    )
+    st.write("Upload the file as `data/FORECAST_10Y.csv` (should contain DATE + median/p10/p90 + RISK_LEVEL).")
 
     fc = load_forecast_csv(FORECAST_10Y_CSV)
     if fc is None:
@@ -423,9 +360,9 @@ elif page == "10-Year Forecast":
         st.dataframe(fc.head(20))
         st.stop()
 
-    # detect a predicted cases column
+    # ✅ Option A: detect predicted cases column including "median"
     case_col = None
-    for c in ["PRED_CASES_CAL", "PRED_CASES", "Predicted_Cases", "PRED_CASES_RAW"]:
+    for c in ["median", "PRED_CASES", "PRED_CASES_CAL", "PRED_CASES_RAW", "p90", "p10"]:
         if c in fc.columns:
             case_col = c
             break
@@ -450,8 +387,27 @@ elif page == "10-Year Forecast":
     st.subheader("Forecast Table")
     st.dataframe(fc_view, use_container_width=True)
 
+    # Risk summary
+    if "RISK_LEVEL" in fc_view.columns:
+        st.subheader("Risk Summary")
+        st.write(fc_view["RISK_LEVEL"].value_counts())
+
+    # Uncertainty plot
     st.subheader("Forecast Trend")
-    st.line_chart(fc_view.set_index("DATE")[case_col])
+    fig = plt.figure()
+    if "median" in fc_view.columns:
+        plt.plot(fc_view["DATE"], fc_view["median"], label="Median forecast")
+    else:
+        plt.plot(fc_view["DATE"], fc_view[case_col], label=case_col)
+
+    if "p10" in fc_view.columns and "p90" in fc_view.columns:
+        plt.fill_between(fc_view["DATE"], fc_view["p10"], fc_view["p90"], alpha=0.2, label="10–90% interval")
+
+    plt.xticks(rotation=45)
+    plt.xlabel("Month")
+    plt.ylabel("Predicted dengue cases")
+    plt.legend()
+    st.pyplot(fig, clear_figure=True)
 
     st.download_button(
         "⬇️ Download filtered forecast CSV",
@@ -460,31 +416,29 @@ elif page == "10-Year Forecast":
         mime="text/csv"
     )
 
-    st.caption(
-        "Note: Long-horizon forecasts should be presented as scenario outputs. "
-        "Report accuracy metrics only on observed dengue years."
-    )
+    st.caption("Note: 10-year forecasts are scenario outputs; report MAE/RMSE only on observed years.")
 
 
 # =========================
-# PAGE: DEBUG / FILES
+# PAGE 3: DEBUG
 # =========================
 else:
     st.title("🧪 Debug / Files")
-    st.write("Use this page to verify that your files/columns match your trained model.")
 
     st.subheader("Model input shape")
     st.write(model.input_shape)
 
     st.subheader("feature_cols.json (expected by model)")
     st.write(f"Count: {len(feature_cols)}")
-    st.write(feature_cols)
+    st.write(feature_cols[:50])
+    if len(feature_cols) > 50:
+        st.write("...")
 
     st.subheader("features_monthly.csv columns")
     st.write(f"Count: {len(features_df.columns)}")
     st.write(list(features_df.columns))
 
-    st.subheader("Preview")
+    st.subheader("Preview of features_monthly.csv")
     st.dataframe(features_df.head(10), use_container_width=True)
 
     st.subheader("Forecast file status")
